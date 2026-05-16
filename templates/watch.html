@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Watch — RareStudy{% endblock %}
+{% block head %}
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/plyr/3.7.8/plyr.css">
+<script src="https://cdn.jsdelivr.net/npm/shaka-player@4.3.5/dist/shaka-player.compiled.min.js"></script>
+<style>.video-box{background:#000;border-radius:16px;overflow:hidden;aspect-ratio:16/9;margin-top:16px}#player{width:100%;height:100%}.msg{padding:20px;color:var(--muted);text-align:center}</style>
+{% endblock %}
+{% block header_left %}<a href="javascript:history.back()" class="back-link">← Back</a>{% endblock %}
+{% block content %}
+<h1 class="page-title" style="font-size:1.2rem">{{ title }}</h1>
+<div class="video-box"><video id="player" playsinline controls></video></div>
+<div id="msg" class="msg"></div>
+{% endblock %}
+{% block scripts %}
+<script>
+(async()=>{
+  const p=new URLSearchParams({batch_id:{{batch_id|tojson}},subject_id:{{subject_id|tojson}},topic_id:{{topic_id|tojson}},schedule_id:{{schedule_id|tojson}},video_id:{{video_id|tojson}}});
+  const msg=document.getElementById('msg'),el=document.getElementById('player');
+  try{
+    const d=await(await fetch('/api/v1/video_slides?'+p)).json();
+    const url=d.video_url||d.hls_url;
+    if(url){if(url.includes('.mpd')&&shaka){await new shaka.Player(el).load(url);}else{el.src=url;}return;}
+  }catch(e){}
+  msg.innerHTML='<a href="{{ external_play_url }}" target="_blank">Open player on StudyStark ↗</a>';
+})();
+</script>
+{% endblock %}

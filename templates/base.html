@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}RareStudy{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <header class="app-header">
+    {% block header_left %}<button type="button" class="btn-icon" id="menuBtn">☰</button>{% endblock %}
+    <div class="brand">RareStudy</div>
+    {% block header_right %}{% endblock %}
+  </header>
+  <div id="menuOverlay" class="menu-overlay"></div>
+  <nav id="sideMenu" class="side-menu">
+    <a href="{{ url_for('batches') }}">All Batches</a>
+    <a href="https://t.me/rarestudy" target="_blank">Telegram</a>
+  </nav>
+  <main class="page">{% block content %}{% endblock %}</main>
+  <script>
+    const mb=document.getElementById('menuBtn'),sm=document.getElementById('sideMenu'),ov=document.getElementById('menuOverlay');
+    if(mb){mb.onclick=()=>{sm.classList.toggle('open');ov.classList.toggle('open');};}
+    if(ov){ov.onclick=()=>{sm.classList.remove('open');ov.classList.remove('open');};}
+  </script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>
