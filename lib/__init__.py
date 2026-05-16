@@ -1,0 +1,1 @@
+# RareStudy shared library
