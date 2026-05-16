@@ -203,6 +203,7 @@ def map_proxy_content_items(items, batch_id, subject_id, topic_id, section):
                     topic_id=topic_id,
                     schedule_id=schedule_id,
                     video_id=video_id,
+                    title=name,
                 )
                 content.append({
                     'type': 'video',
@@ -368,32 +369,10 @@ async def process_chapters(session, chapter_id, batch_id, subject_id, content_ty
 
 async def fetch_chapter_content_async(batch_id, subject_id, chapter_id, section, token):
     if USE_DATA_API and token:
-        page = 1
-        combined = []
-        while True:
-            data = call_data_api(
-                'content',
-                token=token,
-                batch_id=batch_id,
-                subject_id=subject_id,
-                topic_id=chapter_id,
-                content_type=section,
-                page=page,
-            )
-            if not (data and data.get('success')):
-                break
-            items = data.get('data', [])
-            if not items:
-                break
-            combined.extend(map_proxy_content_items(items, batch_id, subject_id, chapter_id, section))
-            paginate = data.get('paginate', {})
-            total = paginate.get('totalCount', len(combined))
-            limit = paginate.get('limit', 20)
-            if page * limit >= total:
-                break
-            page += 1
-        if combined:
-            return combined
+        from lib import studystark
+        items = studystark.get_content(batch_id, subject_id, chapter_id, section, token)
+        if items:
+            return map_proxy_content_items(items, batch_id, subject_id, chapter_id, section)
 
     if token and is_penpencil_token(token):
         headers = get_headers(token)
@@ -403,11 +382,10 @@ async def fetch_chapter_content_async(batch_id, subject_id, chapter_id, section,
 
 async def fetch_subjects_async(batch_id, token):
     if USE_DATA_API:
-        data = call_data_api('batch_details', token=token, batch_id=batch_id)
-        if data and data.get('success'):
-            subjects = data.get('data', {}).get('subjects', [])
-            if subjects:
-                return subjects
+        from lib import studystark
+        subjects = studystark.get_subjects(batch_id, token)
+        if subjects:
+            return subjects
 
     if token and is_penpencil_token(token):
         headers = get_headers(token)
@@ -420,30 +398,10 @@ async def fetch_subjects_async(batch_id, token):
 
 async def fetch_chapters_async(batch_id, subject_id, token):
     if USE_DATA_API and token:
-        all_chapters = []
-        page = 1
-        while True:
-            data = call_data_api(
-                'topics',
-                token=token,
-                batch_id=batch_id,
-                subject_id=subject_id,
-                page=page,
-            )
-            if not (data and data.get('success')):
-                break
-            chapters = data.get('data', [])
-            if not chapters:
-                break
-            all_chapters.extend(chapters)
-            paginate = data.get('paginate', {})
-            total = paginate.get('totalCount', len(all_chapters))
-            limit = paginate.get('limit', 20)
-            if page * limit >= total:
-                break
-            page += 1
-        if all_chapters:
-            return all_chapters
+        from lib import studystark
+        chapters = studystark.get_topics(batch_id, subject_id, token)
+        if chapters:
+            return chapters
 
     if token and is_penpencil_token(token):
         headers = get_headers(token)
@@ -541,11 +499,10 @@ async def get_schedule_details(batch_id, token, subject_id, schedule_id):
 
 async def get_todays_schedule(batch_id, token):
     if USE_DATA_API and token:
-        data = call_data_api('today_schedule', token=token, batch_id=batch_id)
-        if data and data.get('success'):
-            schedule_data = data.get('data', [])
-            if schedule_data:
-                return map_proxy_schedule_items(schedule_data, batch_id)
+        from lib import studystark
+        schedule_data = studystark.get_today_schedule(batch_id, token)
+        if schedule_data:
+            return map_proxy_schedule_items(schedule_data, batch_id)
 
     if token and is_penpencil_token(token):
         headers = get_headers(token)
@@ -589,25 +546,21 @@ def fetch_access_token():
 
 @app.before_request
 def ensure_token():
-    """Refresh session token when possible; never block page loads on token failure."""
+    """Auto-load PW_ACCESS_TOKEN from env into session (StudyStark proxy token)."""
     if request.endpoint == 'static':
+        return
+
+    env_token = fetch_access_token()
+    if env_token:
+        session.permanent = True
+        session['token'] = env_token
         return
 
     token = session.get('token')
     if token and validate_token(token):
         return
 
-    new_token = fetch_access_token()
-    if new_token:
-        session.permanent = True
-        session['token'] = new_token
-        return
-
-    if token:
-        logging.warning("Keeping existing session token after validation/refresh failed")
-        return
-
-    logging.warning("No access token available; pages load but PenPencil API calls may fail")
+    logging.warning("No PW_ACCESS_TOKEN — set it in Vercel env for lectures")
 
 def validate_token(token):
     """Accept PenPencil bearer tokens or StudyStark-style proxy tokens."""
@@ -897,27 +850,49 @@ def chapters(encoded_params):
 
 @app.route('/api/v1/<action>')
 def api_v1(action):
-    from lib.pw_proxy import proxy_action
-    result = proxy_action(action, **request.args)
-    return jsonify(result or {'success': False, 'message': 'Proxy error'})
+    """StudyStark proxy — same as studystark.com/data-api.php + playlist + video_slides."""
+    from lib import studystark
+    token = session.get('token') or studystark.get_token()
+    args = dict(request.args)
 
+    if action == 'token_status':
+        if not token:
+            return jsonify({'success': False, 'configured': False, 'message': 'Set PW_ACCESS_TOKEN'})
+        probe = studystark.data_api('topics', token, batch_id='x', subject_id='x', page=1)
+        ok = bool(probe and probe.get('success'))
+        return jsonify({'success': ok, 'configured': True, 'valid': ok})
 
-@app.route('/api/token-status')
-def api_token_status():
-    from lib.pw_proxy import proxy_action
-    return jsonify(proxy_action('token_status', **request.args))
+    if action == 'playlist':
+        result = studystark.get_playlist(
+            args.get('batch_id'), args.get('subject_id'), args.get('topic_id'),
+            args.get('schedule_id'), token, args.get('play_type', 'Lecture'),
+        )
+    elif action == 'video_slides':
+        result = studystark.get_video_slides(
+            args.get('batch_id'), args.get('subject_id'), args.get('video_id'), token,
+        )
+    elif action in ('batches', 'batch_details', 'topics', 'content', 'today_schedule'):
+        result = studystark.data_api(action, token, **{k: args[k] for k in args if k != 'action'})
+    else:
+        return jsonify({'success': False, 'message': 'Invalid action', 'actions': [
+            'batches', 'batch_details', 'topics', 'content', 'today_schedule',
+            'playlist', 'video_slides', 'token_status',
+        ]})
+
+    return jsonify(result or {'success': False, 'message': 'Upstream error'})
 
 
 @app.route('/watch')
 def watch():
-    from lib.pw_proxy import build_studystark_play_url
+    from lib import studystark
     batch_id = request.args.get('batch_id', '')
     subject_id = request.args.get('subject_id', '')
     topic_id = request.args.get('topic_id', '')
     schedule_id = request.args.get('schedule_id', '')
     video_id = request.args.get('video_id', '')
     title = request.args.get('title', 'Lecture')
-    external = build_studystark_play_url(batch_id, subject_id, topic_id, schedule_id)
+    token = session.get('token') or studystark.get_token()
+    external = studystark.play_url(batch_id, subject_id, topic_id, schedule_id, token)
     return render_template(
         'watch.html',
         batch_id=batch_id,
