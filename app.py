@@ -167,17 +167,18 @@ def is_penpencil_token(token):
     except Exception:
         return False
 
-def map_proxy_content_items(items, batch_id, section):
+def map_proxy_content_items(items, batch_id, subject_id, topic_id, section):
     """Map data-api content response to template-friendly items."""
     content = []
     for item in items or []:
         if section in ('videos', 'DppVideos'):
             video_details = item.get('videoDetails') or {}
             name = item.get('topic') or item.get('name', 'Video')
-            child_id = item.get('_id', '')
+            schedule_id = item.get('_id', '')
+            video_id = video_details.get('_id') or video_details.get('id', '')
             embed = item.get('embedCode') or video_details.get('embedCode')
             video_url = item.get('videoUrl') or video_details.get('videoUrl')
-            thumbnail = item.get('image') or video_details.get('image', '')
+            thumbnail = video_details.get('image') or item.get('image', '')
 
             if embed:
                 content.append({'type': 'video', 'name': name, 'videoUrl': embed, 'thumbnail': thumbnail})
@@ -186,12 +187,27 @@ def map_proxy_content_items(items, batch_id, section):
                     batch_id=batch_id,
                     url=video_url,
                     parent_id=batch_id,
-                    child_id=child_id,
+                    child_id=schedule_id,
                 )
                 content.append({
                     'type': 'video',
                     'name': name,
                     'videoUrl': f"/media/{encoded_params}",
+                    'thumbnail': thumbnail,
+                })
+            else:
+                play_url = url_for(
+                    'watch',
+                    batch_id=batch_id,
+                    subject_id=subject_id,
+                    topic_id=topic_id,
+                    schedule_id=schedule_id,
+                    video_id=video_id,
+                )
+                content.append({
+                    'type': 'video',
+                    'name': name,
+                    'videoUrl': play_url,
                     'thumbnail': thumbnail,
                 })
         elif section in ('notes', 'DppNotes'):
@@ -215,11 +231,13 @@ def map_proxy_content_items(items, batch_id, section):
             content.append({'type': 'note', 'name': item.get('name', item.get('topic', 'Note')), 'url': url})
     return content
 
-def map_proxy_schedule_items(items, batch_id):
+def map_proxy_schedule_items(items, batch_id, subject_id=''):
     """Map today_schedule data-api response."""
     content = []
     for item in items or []:
-        mapped = map_proxy_content_items([item], batch_id, 'videos')
+        sid = item.get('batchSubjectId') or subject_id
+        tid = (item.get('tags') or [{}])[0].get('_id', '') if item.get('tags') else ''
+        mapped = map_proxy_content_items([item], batch_id, sid, tid, 'videos')
         for video in mapped:
             video['subject_name'] = item.get('subject_name') or item.get('subject', {}).get('name', '')
             if isinstance(item.get('subject'), str):
@@ -367,7 +385,7 @@ async def fetch_chapter_content_async(batch_id, subject_id, chapter_id, section,
             items = data.get('data', [])
             if not items:
                 break
-            combined.extend(map_proxy_content_items(items, batch_id, section))
+            combined.extend(map_proxy_content_items(items, batch_id, subject_id, chapter_id, section))
             paginate = data.get('paginate', {})
             total = paginate.get('totalCount', len(combined))
             limit = paginate.get('limit', 20)
@@ -552,10 +570,11 @@ async def get_todays_schedule(batch_id, token):
     
 
 def fetch_access_token():
-    """Obtain a PenPencil access token from environment or remote service."""
-    env_token = os.environ.get('PW_ACCESS_TOKEN') or os.environ.get('ACCESS_TOKEN')
+    """Token from .env / Vercel — auto-loaded, no key generation."""
+    from lib.pw_proxy import get_access_token
+    env_token = get_access_token()
     if env_token:
-        return env_token.strip()
+        return env_token
 
     try:
         response = requests.get(TOKEN_API_URL, timeout=50)
@@ -875,6 +894,41 @@ def chapters(encoded_params):
     token = session.get('token')
     chapters = run_async_optimized(fetch_chapters_async(batch_id, subject_id, token))
     return render_template('chapters.html', chapters=chapters, batch_id=batch_id, subject_id=subject_id)
+
+@app.route('/api/v1/<action>')
+def api_v1(action):
+    from lib.pw_proxy import proxy_action
+    result = proxy_action(action, **request.args)
+    return jsonify(result or {'success': False, 'message': 'Proxy error'})
+
+
+@app.route('/api/token-status')
+def api_token_status():
+    from lib.pw_proxy import proxy_action
+    return jsonify(proxy_action('token_status', **request.args))
+
+
+@app.route('/watch')
+def watch():
+    from lib.pw_proxy import build_studystark_play_url
+    batch_id = request.args.get('batch_id', '')
+    subject_id = request.args.get('subject_id', '')
+    topic_id = request.args.get('topic_id', '')
+    schedule_id = request.args.get('schedule_id', '')
+    video_id = request.args.get('video_id', '')
+    title = request.args.get('title', 'Lecture')
+    external = build_studystark_play_url(batch_id, subject_id, topic_id, schedule_id)
+    return render_template(
+        'watch.html',
+        batch_id=batch_id,
+        subject_id=subject_id,
+        topic_id=topic_id,
+        schedule_id=schedule_id,
+        video_id=video_id,
+        title=title,
+        external_play_url=external,
+    )
+
 
 @app.route('/stream/<encoded_params>/<section>')
 def section_content(encoded_params, section):
