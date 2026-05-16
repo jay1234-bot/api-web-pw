@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, jsonify, redirect, url_for, session, abort
+from flask import Flask, render_template, request, jsonify, redirect, url_for, session
 from datetime import timedelta, datetime
 import requests
 import re
@@ -16,6 +16,22 @@ from Crypto.Util.Padding import pad, unpad
 from base64 import b64encode, b64decode
 import os
 import pickle
+
+def _load_dotenv():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
+    if not os.path.isfile(env_path):
+        return
+    with open(env_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, _, value = line.partition('=')
+            key, value = key.strip(), value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+_load_dotenv()
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -35,6 +51,17 @@ HEADERS_TEMPLATE = {
 }
 
 BATCHES_FILE = 'mybatches.json'
+TOKEN_API_URL = os.environ.get(
+    'TOKEN_API_URL',
+    'https://pwlogintoken-b99dfabfaab6.herokuapp.com/update-login-token',
+)
+DATA_API_URL = os.environ.get('DATA_API_URL', 'https://studystark.com/data-api.php')
+USE_DATA_API = os.environ.get('USE_DATA_API', 'true').lower() not in ('0', 'false', 'no')
+DATA_API_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+    'X-Requested-With': 'SPA-Client',
+    'Referer': os.environ.get('DATA_API_REFERER', 'https://studystark.com/'),
+}
 
 # Optimized thread pool with proper limits
 executor = ThreadPoolExecutor(max_workers=100)
@@ -106,6 +133,107 @@ def get_headers(token):
     headers = HEADERS_TEMPLATE.copy()
     headers['authorization'] = f"Bearer {token}"
     return headers
+
+def call_data_api(action, token=None, **params):
+    """Call StudyStark-style data-api proxy (topics, batch_details, content, etc.)."""
+    if not USE_DATA_API:
+        return None
+    query = {'action': action}
+    for key, value in params.items():
+        if value is not None:
+            query[key] = value
+    if token:
+        query['token'] = token
+    try:
+        response = requests.get(DATA_API_URL, params=query, headers=DATA_API_HEADERS, timeout=60)
+        if response.status_code == 200:
+            return response.json()
+        logging.warning(f"Data API {action} returned HTTP {response.status_code}")
+    except Exception as e:
+        logging.error(f"Data API {action} failed: {e}")
+    return None
+
+def is_penpencil_token(token):
+    if not token:
+        return False
+    try:
+        headers = get_headers(token)
+        response = requests.post(
+            "https://api.penpencil.co/v3/oauth/verify-token",
+            headers=headers,
+            timeout=15,
+        )
+        return response.status_code == 200
+    except Exception:
+        return False
+
+def map_proxy_content_items(items, batch_id, section):
+    """Map data-api content response to template-friendly items."""
+    content = []
+    for item in items or []:
+        if section in ('videos', 'DppVideos'):
+            video_details = item.get('videoDetails') or {}
+            name = item.get('topic') or item.get('name', 'Video')
+            child_id = item.get('_id', '')
+            embed = item.get('embedCode') or video_details.get('embedCode')
+            video_url = item.get('videoUrl') or video_details.get('videoUrl')
+            thumbnail = item.get('image') or video_details.get('image', '')
+
+            if embed:
+                content.append({'type': 'video', 'name': name, 'videoUrl': embed, 'thumbnail': thumbnail})
+            elif video_url:
+                encoded_params = encode_params(
+                    batch_id=batch_id,
+                    url=video_url,
+                    parent_id=batch_id,
+                    child_id=child_id,
+                )
+                content.append({
+                    'type': 'video',
+                    'name': name,
+                    'videoUrl': f"/media/{encoded_params}",
+                    'thumbnail': thumbnail,
+                })
+        elif section in ('notes', 'DppNotes'):
+            url = item.get('url')
+            if not url:
+                base_url = item.get('baseUrl', '')
+                key = item.get('key', '')
+                if base_url and key:
+                    url = base_url + key
+            if not url:
+                for homework in item.get('homeworkIds', []):
+                    for attachment in homework.get('attachmentIds', []):
+                        note_url = attachment.get('baseUrl', '') + attachment.get('key', '')
+                        if note_url:
+                            content.append({
+                                'type': 'note',
+                                'name': homework.get('topic', item.get('name', 'Note')),
+                                'url': note_url,
+                            })
+                continue
+            content.append({'type': 'note', 'name': item.get('name', item.get('topic', 'Note')), 'url': url})
+    return content
+
+def map_proxy_schedule_items(items, batch_id):
+    """Map today_schedule data-api response."""
+    content = []
+    for item in items or []:
+        mapped = map_proxy_content_items([item], batch_id, 'videos')
+        for video in mapped:
+            video['subject_name'] = item.get('subject_name') or item.get('subject', {}).get('name', '')
+            if isinstance(item.get('subject'), str):
+                video['subject_name'] = item.get('subject')
+            video['startTime'] = item.get('startTime', '')
+            content.append(video)
+        if item.get('type') == 'note' and item.get('url'):
+            content.append({
+                'type': 'note',
+                'name': item.get('name', ''),
+                'url': item['url'],
+                'subject_name': item.get('subject_name', ''),
+            })
+    return content
 
 async def create_session():
     """Create optimized aiohttp session"""
@@ -221,37 +349,103 @@ async def process_chapters(session, chapter_id, batch_id, subject_id, content_ty
     return combined_content
 
 async def fetch_chapter_content_async(batch_id, subject_id, chapter_id, section, token):
-    headers = get_headers(token)
-    async with await create_session() as session:
-        return await process_chapters(session, chapter_id, batch_id, subject_id, section, headers)
+    if USE_DATA_API and token:
+        page = 1
+        combined = []
+        while True:
+            data = call_data_api(
+                'content',
+                token=token,
+                batch_id=batch_id,
+                subject_id=subject_id,
+                topic_id=chapter_id,
+                content_type=section,
+                page=page,
+            )
+            if not (data and data.get('success')):
+                break
+            items = data.get('data', [])
+            if not items:
+                break
+            combined.extend(map_proxy_content_items(items, batch_id, section))
+            paginate = data.get('paginate', {})
+            total = paginate.get('totalCount', len(combined))
+            limit = paginate.get('limit', 20)
+            if page * limit >= total:
+                break
+            page += 1
+        if combined:
+            return combined
+
+    if token and is_penpencil_token(token):
+        headers = get_headers(token)
+        async with await create_session() as session:
+            return await process_chapters(session, chapter_id, batch_id, subject_id, section, headers)
+    return []
 
 async def fetch_subjects_async(batch_id, token):
-    headers = get_headers(token)
-    async with await create_session() as session:
-        url = f'https://api.penpencil.co/v3/batches/{batch_id}/details'
-        data = await fetch_data(session, url, headers, method='GET')
-        if data and data.get("success"):
-            return data.get('data', {}).get('subjects', [])
-        return []
+    if USE_DATA_API:
+        data = call_data_api('batch_details', token=token, batch_id=batch_id)
+        if data and data.get('success'):
+            subjects = data.get('data', {}).get('subjects', [])
+            if subjects:
+                return subjects
 
-async def fetch_chapters_async(batch_id, subject_id, token):
-    headers = get_headers(token)
-    all_chapters = []
-    page = 1
-    async with await create_session() as session:
-        while True:
-            url = f"https://api.penpencil.co/v2/batches/{batch_id}/subject/{subject_id}/topics?page={page}"
+    if token and is_penpencil_token(token):
+        headers = get_headers(token)
+        async with await create_session() as session:
+            url = f'https://api.penpencil.co/v3/batches/{batch_id}/details'
             data = await fetch_data(session, url, headers, method='GET')
             if data and data.get("success"):
-                chapters = data.get("data", [])
-                if chapters:
-                    all_chapters.extend(chapters)
-                    page += 1
+                return data.get('data', {}).get('subjects', [])
+    return []
+
+async def fetch_chapters_async(batch_id, subject_id, token):
+    if USE_DATA_API and token:
+        all_chapters = []
+        page = 1
+        while True:
+            data = call_data_api(
+                'topics',
+                token=token,
+                batch_id=batch_id,
+                subject_id=subject_id,
+                page=page,
+            )
+            if not (data and data.get('success')):
+                break
+            chapters = data.get('data', [])
+            if not chapters:
+                break
+            all_chapters.extend(chapters)
+            paginate = data.get('paginate', {})
+            total = paginate.get('totalCount', len(all_chapters))
+            limit = paginate.get('limit', 20)
+            if page * limit >= total:
+                break
+            page += 1
+        if all_chapters:
+            return all_chapters
+
+    if token and is_penpencil_token(token):
+        headers = get_headers(token)
+        all_chapters = []
+        page = 1
+        async with await create_session() as session:
+            while True:
+                url = f"https://api.penpencil.co/v2/batches/{batch_id}/subject/{subject_id}/topics?page={page}"
+                data = await fetch_data(session, url, headers, method='GET')
+                if data and data.get("success"):
+                    chapters = data.get("data", [])
+                    if chapters:
+                        all_chapters.extend(chapters)
+                        page += 1
+                    else:
+                        break
                 else:
                     break
-            else:
-                break
-    return all_chapters
+        return all_chapters
+    return []
 
 async def get_schedule_details(batch_id, token, subject_id, schedule_id):
     headers = get_headers(token)
@@ -328,63 +522,81 @@ async def get_schedule_details(batch_id, token, subject_id, schedule_id):
         return content
 
 async def get_todays_schedule(batch_id, token):
-    headers = get_headers(token)
-    async with await create_session() as session:
-        url = f"https://api.penpencil.co/v1/batches/{batch_id}/todays-schedule"
-        data = await fetch_data(session, url, headers, method='GET')
-        all_content = []
+    if USE_DATA_API and token:
+        data = call_data_api('today_schedule', token=token, batch_id=batch_id)
+        if data and data.get('success'):
+            schedule_data = data.get('data', [])
+            if schedule_data:
+                return map_proxy_schedule_items(schedule_data, batch_id)
 
-        if data and data.get("success") and data.get("data"):
-            tasks = []
-            for item in data['data']:
-                schedule_id = item.get('_id')
-                subject_id = item.get('batchSubjectId')
-                tasks.append(get_schedule_details(batch_id, token, subject_id, schedule_id))
-            
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for result in results:
-                if isinstance(result, list):
-                    all_content.extend(result)
-    return all_content
+    if token and is_penpencil_token(token):
+        headers = get_headers(token)
+        async with await create_session() as session:
+            url = f"https://api.penpencil.co/v1/batches/{batch_id}/todays-schedule"
+            data = await fetch_data(session, url, headers, method='GET')
+            all_content = []
+
+            if data and data.get("success") and data.get("data"):
+                tasks = []
+                for item in data['data']:
+                    schedule_id = item.get('_id')
+                    subject_id = item.get('batchSubjectId')
+                    tasks.append(get_schedule_details(batch_id, token, subject_id, schedule_id))
+                
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, list):
+                        all_content.extend(result)
+        return all_content
+    return []
     
+
+def fetch_access_token():
+    """Obtain a PenPencil access token from environment or remote service."""
+    env_token = os.environ.get('PW_ACCESS_TOKEN') or os.environ.get('ACCESS_TOKEN')
+    if env_token:
+        return env_token.strip()
+
+    try:
+        response = requests.get(TOKEN_API_URL, timeout=50)
+        if response.status_code == 200:
+            data = response.json()
+            return data.get('access_token') or data.get('token')
+        logging.warning(f"Token API returned {response.status_code}")
+    except Exception as e:
+        logging.warning(f"Token fetch failed: {e}")
+    return None
+
 
 @app.before_request
 def ensure_token():
-    """Ensure user has a valid token before processing requests"""
+    """Refresh session token when possible; never block page loads on token failure."""
     if request.endpoint == 'static':
         return
-    
+
     token = session.get('token')
-    
-    if not token or not validate_token(token):
-        try:
-            response = requests.get("https://pwlogintoken-b99dfabfaab6.herokuapp.com/update-login-token", timeout=50)
-            if response.status_code == 200:
-                data = response.json()
-                new_token = data.get('access_token')
-                if new_token:
-                    session.permanent = True
-                    session['token'] = new_token
-                else:
-                    abort(503, description='Unable to obtain access token. Please try again later.')
-            else:
-                abort(503, description='Unable to obtain access token. Please try again later.')
-        except Exception:
-            abort(503, description='Unable to obtain access token. Please try again later.')
+    if token and validate_token(token):
+        return
+
+    new_token = fetch_access_token()
+    if new_token:
+        session.permanent = True
+        session['token'] = new_token
+        return
+
+    if token:
+        logging.warning("Keeping existing session token after validation/refresh failed")
+        return
+
+    logging.warning("No access token available; pages load but PenPencil API calls may fail")
 
 def validate_token(token):
-    """Simple token validation with timeout"""
-    try:
-        headers = get_headers(token)
-        
-        response = requests.post(
-        "https://api.penpencil.co/v3/oauth/verify-token",
-        headers=headers,
-        timeout=30)
-        
-        return response.status_code == 200
-    except:
-        return False
+    """Accept PenPencil bearer tokens or StudyStark-style proxy tokens."""
+    if is_penpencil_token(token):
+        return True
+    if USE_DATA_API and token and len(token) > 80:
+        return True
+    return False
 
 @app.route('/')
 def home():
